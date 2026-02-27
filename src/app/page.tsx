@@ -1,4 +1,6 @@
+import { AboutSection } from "@/components/about-section";
 import { HeroSection } from "@/components/hero-section";
+import { ProductsSection } from "@/components/products-section";
 import { ServicesSection } from "@/components/services-section";
 import { SiteFooter } from "@/components/site-footer";
 import { SiteHeader } from "@/components/site-header";
@@ -23,8 +25,14 @@ export default function HomePage() {
         secondaryCta={content.hero.secondaryCta}
       />
 
+      {content.about ? <AboutSection title={content.about.title} body={content.about.body} /> : null}
+
       {content.services ? (
         <ServicesSection title={content.services.sectionTitle} items={content.services.items} />
+      ) : null}
+
+      {content.products ? (
+        <ProductsSection title={content.products.sectionTitle} items={content.products.items} />
       ) : null}
 
       {content.testimonials ? (

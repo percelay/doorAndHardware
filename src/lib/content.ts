@@ -1,12 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 
-export type MarkdownSection = {
-  title: string;
-  level: number;
-  lines: string[];
-};
-
 export type CtaLink = {
   label: string;
   href: string;
@@ -21,7 +15,15 @@ export type SiteContent = {
     primaryCta?: CtaLink;
     secondaryCta?: CtaLink;
   };
+  about: {
+    title: string;
+    body: string;
+  } | null;
   services: {
+    sectionTitle: string;
+    items: Array<{ title: string; description: string }>;
+  } | null;
+  products: {
     sectionTitle: string;
     items: Array<{ title: string; description: string }>;
   } | null;
@@ -36,12 +38,14 @@ export type SiteContent = {
   navItems: Array<{ label: string; href: string }>;
 };
 
-const KEYWORDS = {
-  hero: ["hero", "home", "overview", "introduction", "intro"],
-  services: ["services", "service", "features", "feature", "offerings"],
-  testimonials: ["testimonials", "testimonial", "reviews", "review"],
-  contact: ["contact", "get in touch", "reach us"]
-};
+const SECTION_LABELS = [
+  "Hero",
+  "About",
+  "Services",
+  "Products and Partners",
+  "Testimonials",
+  "Contact"
+] as const;
 
 function slugify(value: string): string {
   return value
@@ -51,247 +55,302 @@ function slugify(value: string): string {
     .replace(/\s+/g, "-");
 }
 
-function parseSections(raw: string): MarkdownSection[] {
-  const lines = raw.split(/\r?\n/);
-  const sections: MarkdownSection[] = [];
-  let current: MarkdownSection = { title: "", level: 0, lines: [] };
-
-  for (const line of lines) {
-    const headingMatch = line.match(/^(#{1,6})\s+(.*\S)\s*$/);
-    if (headingMatch) {
-      sections.push(current);
-      current = {
-        title: headingMatch[2].trim(),
-        level: headingMatch[1].length,
-        lines: []
-      };
-      continue;
-    }
-    current.lines.push(line);
-  }
-
-  sections.push(current);
-  return sections.filter((section) => section.title || section.lines.some((line) => line.trim()));
-}
-
-function getSectionByKeyword(
-  sections: MarkdownSection[],
-  keywords: string[]
-): { section: MarkdownSection; index: number } | null {
-  for (let i = 0; i < sections.length; i += 1) {
-    const title = sections[i].title.toLowerCase();
-    if (keywords.some((keyword) => title.includes(keyword))) {
-      return { section: sections[i], index: i };
-    }
-  }
-  return null;
-}
-
-function getChildSections(sections: MarkdownSection[], parentIndex: number): MarkdownSection[] {
-  const parent = sections[parentIndex];
-  const children: MarkdownSection[] = [];
-
-  for (let i = parentIndex + 1; i < sections.length; i += 1) {
-    const section = sections[i];
-    if (section.level <= parent.level) {
-      break;
-    }
-    if (section.level === parent.level + 1) {
-      children.push(section);
-    }
-  }
-
-  return children;
+function isArtifactLine(line: string): boolean {
+  return /^\+\d+$/.test(line.trim());
 }
 
 function compactLines(lines: string[]): string[] {
-  return lines.map((line) => line.trim()).filter(Boolean);
+  return lines.map((line) => line.trim()).filter((line) => line && !isArtifactLine(line));
 }
 
-function parseLinks(raw: string): CtaLink[] {
-  const links: CtaLink[] = [];
-  const regex = /\[([^\]]+)\]\(([^)]+)\)/g;
-  let match = regex.exec(raw);
+function startsWithCi(line: string, prefix: string): boolean {
+  return line.toLowerCase().startsWith(prefix.toLowerCase());
+}
 
-  while (match) {
-    links.push({ label: match[1].trim(), href: match[2].trim() });
-    match = regex.exec(raw);
+function extractBetween(source: string, startLabel: string, endLabel?: string): string {
+  const lower = source.toLowerCase();
+  const start = lower.indexOf(startLabel.toLowerCase());
+  if (start < 0) return "";
+  const valueStart = start + startLabel.length;
+  if (!endLabel) {
+    return source.slice(valueStart).trim();
   }
 
-  return links;
+  const end = lower.indexOf(endLabel.toLowerCase(), valueStart);
+  if (end < 0) {
+    return source.slice(valueStart).trim();
+  }
+  return source.slice(valueStart, end).trim();
 }
 
-function parseServiceFallbackItems(lines: string[]): Array<{ title: string; description: string }> {
-  const bulletItems = compactLines(lines)
-    .map((line) => line.match(/^[-*+]\s+(.+)$/)?.[1])
-    .filter((line): line is string => Boolean(line));
+function splitPlainSections(raw: string): {
+  brandName: string;
+  sections: Record<(typeof SECTION_LABELS)[number], string[]>;
+} {
+  const lines = raw.split(/\r?\n/);
+  const sections = Object.fromEntries(
+    SECTION_LABELS.map((label) => [label, [] as string[]])
+  ) as Record<(typeof SECTION_LABELS)[number], string[]>;
+  const labelByLower = new Map(SECTION_LABELS.map((label) => [label.toLowerCase(), label]));
+  const markers: Array<{ index: number; label: (typeof SECTION_LABELS)[number] }> = [];
 
-  if (bulletItems.length > 0) {
-    return bulletItems
-      .map((item) => {
-        const separatorIndex = item.indexOf(":");
-        if (separatorIndex > 0 && separatorIndex < item.length - 1) {
-          return {
-            title: item.slice(0, separatorIndex).trim(),
-            description: item.slice(separatorIndex + 1).trim()
-          };
+  for (let i = 0; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim();
+    const canonical = labelByLower.get(trimmed.toLowerCase());
+    if (canonical) {
+      markers.push({ index: i, label: canonical });
+    }
+  }
+
+  for (let i = 0; i < markers.length; i += 1) {
+    const current = markers[i];
+    const next = markers[i + 1];
+    const start = current.index + 1;
+    const end = next ? next.index : lines.length;
+    sections[current.label] = lines.slice(start, end);
+  }
+
+  const firstMarkerIndex = markers.length > 0 ? markers[0].index : lines.length;
+  const introLines = compactLines(lines.slice(0, firstMarkerIndex));
+  const brandName = introLines[0] ?? "";
+
+  return { brandName, sections };
+}
+
+function parseHero(
+  lines: string[],
+  hasServices: boolean,
+  hasContact: boolean
+): SiteContent["hero"] {
+  const normalizedLines = compactLines(lines);
+  const joined = normalizedLines.join(" ");
+
+  const title = extractBetween(joined, "Headline:", "Subheadline:") || normalizedLines[0] || "";
+  const subtitle = extractBetween(joined, "Subheadline:", "Primary CTA:");
+  const primaryLabel = extractBetween(joined, "Primary CTA:", "Secondary CTA:");
+  const secondaryLabel = extractBetween(joined, "Secondary CTA:");
+
+  const primaryCta = primaryLabel
+    ? {
+        label: primaryLabel,
+        href: hasContact ? `#${slugify("Contact")}` : "#"
+      }
+    : undefined;
+
+  const secondaryCta = secondaryLabel
+    ? {
+        label: secondaryLabel,
+        href: hasServices ? `#${slugify("Services")}` : "#"
+      }
+    : undefined;
+
+  return {
+    title,
+    subtitle,
+    primaryCta,
+    secondaryCta
+  };
+}
+
+function parseServices(lines: string[]): Array<{ title: string; description: string }> {
+  const normalizedLines = compactLines(lines);
+  const items: Array<{ title: string; description: string }> = [];
+  let currentTitle = "";
+  let descriptionParts: string[] = [];
+
+  const flush = () => {
+    const description = descriptionParts.join(" ").trim();
+    if (currentTitle && description) {
+      items.push({ title: currentTitle, description });
+    }
+    currentTitle = "";
+    descriptionParts = [];
+  };
+
+  for (let i = 0; i < normalizedLines.length; i += 1) {
+    const line = normalizedLines[i];
+    const nextLine = normalizedLines[i + 1] ?? "";
+
+    if (startsWithCi(line, "Title:")) {
+      flush();
+      const payload = line.slice("Title:".length).trim();
+      const descriptionIndex = payload.toLowerCase().indexOf("description:");
+      if (descriptionIndex >= 0) {
+        currentTitle = payload.slice(0, descriptionIndex).trim();
+        const sameLineDescription = payload.slice(descriptionIndex + "description:".length).trim();
+        if (sameLineDescription) {
+          descriptionParts.push(sameLineDescription);
         }
-
-        return {
-          title: item,
-          description: item
-        };
-      })
-      .filter((item) => item.title && item.description);
-  }
-
-  return [];
-}
-
-function parseBlockquoteTestimonials(lines: string[]): Array<{ quote: string; attribution?: string }> {
-  const quotes: Array<{ quote: string; attribution?: string }> = [];
-  let current: string[] = [];
-
-  for (const line of lines) {
-    const match = line.match(/^>\s?(.*)$/);
-    if (match) {
-      current.push(match[1].trim());
+      } else {
+        currentTitle = payload;
+      }
       continue;
     }
 
-    if (current.length > 0) {
-      const [first, ...rest] = current;
-      quotes.push({
-        quote: first,
-        attribution: rest.length > 0 ? rest.join(" ") : undefined
-      });
-      current = [];
+    if (startsWithCi(line, "Description:")) {
+      const payload = line.slice("Description:".length).trim();
+      if (payload) {
+        descriptionParts.push(payload);
+      }
+      continue;
+    }
+
+    if (currentTitle && descriptionParts.length > 0) {
+      if (!startsWithCi(nextLine, "Title:")) {
+        descriptionParts.push(line);
+      }
     }
   }
 
-  if (current.length > 0) {
-    const [first, ...rest] = current;
-    quotes.push({
-      quote: first,
-      attribution: rest.length > 0 ? rest.join(" ") : undefined
-    });
-  }
-
-  return quotes.filter((item) => item.quote);
+  flush();
+  return items;
 }
 
-function collectContactLines(sections: MarkdownSection[], sectionIndex: number): string[] {
-  const parent = sections[sectionIndex];
-  const lines: string[] = [...compactLines(parent.lines)];
+function isLikelySubheading(line: string): boolean {
+  if (!line) return false;
+  if (line.length > 64) return false;
+  if (line.includes(":")) return false;
+  if (/[.!?]$/.test(line)) return false;
+  return /^[A-Za-z0-9&(),\-/'\s]+$/.test(line);
+}
 
-  for (const child of getChildSections(sections, sectionIndex)) {
-    lines.push(child.title);
-    lines.push(...compactLines(child.lines));
+function parseProducts(lines: string[]): Array<{ title: string; description: string }> {
+  const normalizedLines = compactLines(lines);
+  const items: Array<{ title: string; description: string }> = [];
+  let currentTitle = "";
+  let currentDescription: string[] = [];
+
+  const flush = () => {
+    const description = currentDescription.join(" ").trim();
+    if (currentTitle && description) {
+      items.push({ title: currentTitle, description });
+    }
+    currentTitle = "";
+    currentDescription = [];
+  };
+
+  for (const line of normalizedLines) {
+    if (isLikelySubheading(line)) {
+      flush();
+      currentTitle = line;
+      continue;
+    }
+
+    if (currentTitle) {
+      currentDescription.push(line);
+    }
   }
 
-  return lines.filter(Boolean);
+  flush();
+  return items;
+}
+
+function parseTestimonials(lines: string[]): Array<{ quote: string; attribution?: string }> {
+  const normalizedLines = compactLines(lines);
+  const items: Array<{ quote: string; attribution?: string }> = [];
+  let currentQuote = "";
+
+  for (const line of normalizedLines) {
+    if (line.startsWith("-")) {
+      if (currentQuote) {
+        items.push({ quote: currentQuote });
+      }
+      currentQuote = line.replace(/^-+\s*/, "").trim();
+      continue;
+    }
+
+    if (line.startsWith(">")) {
+      if (currentQuote) {
+        items.push({ quote: currentQuote });
+      }
+      currentQuote = line.replace(/^>\s*/, "").trim();
+      continue;
+    }
+
+    if (!currentQuote) {
+      currentQuote = line;
+    } else {
+      currentQuote = `${currentQuote} ${line}`.trim();
+    }
+  }
+
+  if (currentQuote) {
+    items.push({ quote: currentQuote });
+  }
+
+  return items.filter((item) => item.quote);
 }
 
 export function loadSiteContent(): SiteContent {
   const sourcePath = path.join(process.cwd(), "sourcematerial.md");
   const raw = fs.existsSync(sourcePath) ? fs.readFileSync(sourcePath, "utf8") : "";
-  const sections = parseSections(raw);
-  const links = parseLinks(raw);
+  const { brandName, sections } = splitPlainSections(raw);
 
-  const firstH1 = sections.find((section) => section.level === 1)?.title ?? "";
-  const firstNonEmptyLine =
-    raw
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find(Boolean) ?? "";
-  const brandName = firstH1 || firstNonEmptyLine;
+  const hasServices = compactLines(sections.Services).length > 0;
+  const hasContact = compactLines(sections.Contact).length > 0;
+  const hero = parseHero(sections.Hero, hasServices, hasContact);
 
-  const heroMatch = getSectionByKeyword(sections, KEYWORDS.hero);
-  const heroSection = heroMatch?.section ?? sections[0];
-  const heroLines = compactLines(heroSection?.lines ?? []);
-  const heroTitle = heroSection?.title || heroLines[0] || "";
-  const heroSubtitle = heroLines.find((line) => line !== heroTitle) ?? "";
-
-  const servicesMatch = getSectionByKeyword(sections, KEYWORDS.services);
-  const servicesChildren = servicesMatch ? getChildSections(sections, servicesMatch.index) : [];
-  const servicesFromChildren = servicesChildren
-    .map((section) => {
-      const description = compactLines(section.lines).join(" ");
-      return {
-        title: section.title,
-        description
-      };
-    })
-    .filter((item) => item.title && item.description);
-  const servicesFallback = servicesMatch ? parseServiceFallbackItems(servicesMatch.section.lines) : [];
-  const servicesItems = servicesFromChildren.length > 0 ? servicesFromChildren : servicesFallback;
-
-  const testimonialsMatch = getSectionByKeyword(sections, KEYWORDS.testimonials);
-  const testimonialChildren = testimonialsMatch
-    ? getChildSections(sections, testimonialsMatch.index)
-    : [];
-  const testimonialsFromChildren = testimonialChildren
-    .map((section) => ({
-      quote: compactLines(section.lines).join(" "),
-      attribution: section.title
-    }))
-    .filter((item) => item.quote);
-  const testimonialsFallback = testimonialsMatch
-    ? parseBlockquoteTestimonials(testimonialsMatch.section.lines)
-    : [];
-  const testimonialItems =
-    testimonialsFromChildren.length > 0 ? testimonialsFromChildren : testimonialsFallback;
-
-  const contactMatch = getSectionByKeyword(sections, KEYWORDS.contact);
-  const contactLines = contactMatch ? collectContactLines(sections, contactMatch.index) : [];
+  const aboutBody = compactLines(sections.About).join(" ");
+  const servicesItems = parseServices(sections.Services);
+  const productsItems = parseProducts(sections["Products and Partners"]);
+  const testimonialItems = parseTestimonials(sections.Testimonials);
+  const contactLines = compactLines(sections.Contact);
 
   const navItems: Array<{ label: string; href: string }> = [];
-  if (servicesMatch) {
+  if (aboutBody) {
+    navItems.push({ label: "About", href: `#${slugify("About")}` });
+  }
+  if (servicesItems.length > 0) {
+    navItems.push({ label: "Services", href: `#${slugify("Services")}` });
+  }
+  if (productsItems.length > 0) {
     navItems.push({
-      label: servicesMatch.section.title,
-      href: `#${slugify(servicesMatch.section.title)}`
+      label: "Products and Partners",
+      href: `#${slugify("Products and Partners")}`
     });
   }
-  if (testimonialsMatch && testimonialItems.length > 0) {
-    navItems.push({
-      label: testimonialsMatch.section.title,
-      href: `#${slugify(testimonialsMatch.section.title)}`
-    });
+  if (testimonialItems.length > 0) {
+    navItems.push({ label: "Testimonials", href: `#${slugify("Testimonials")}` });
   }
-  if (contactMatch) {
-    navItems.push({
-      label: contactMatch.section.title,
-      href: `#${slugify(contactMatch.section.title)}`
-    });
+  if (contactLines.length > 0) {
+    navItems.push({ label: "Contact", href: `#${slugify("Contact")}` });
   }
 
   return {
     raw,
     brandName,
-    hero: {
-      title: heroTitle,
-      subtitle: heroSubtitle,
-      primaryCta: links[0],
-      secondaryCta: links[1]
-    },
+    hero,
+    about: aboutBody
+      ? {
+          title: "About",
+          body: aboutBody
+        }
+      : null,
     services:
-      servicesMatch && servicesItems.length > 0
+      servicesItems.length > 0
         ? {
-            sectionTitle: servicesMatch.section.title,
+            sectionTitle: "Services",
             items: servicesItems
           }
         : null,
-    testimonials:
-      testimonialsMatch && testimonialItems.length > 0
+    products:
+      productsItems.length > 0
         ? {
-            sectionTitle: testimonialsMatch.section.title,
+            sectionTitle: "Products and Partners",
+            items: productsItems
+          }
+        : null,
+    testimonials:
+      testimonialItems.length > 0
+        ? {
+            sectionTitle: "Testimonials",
             items: testimonialItems
           }
         : null,
     contact:
-      contactMatch && contactLines.length > 0
+      contactLines.length > 0
         ? {
-            title: contactMatch.section.title,
+            title: "Contact",
             lines: contactLines
           }
         : null,
